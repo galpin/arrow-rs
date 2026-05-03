@@ -40,6 +40,7 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::ArrowArrayStreamReader;
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
@@ -51,8 +52,14 @@ use futures::stream::{BoxStream, StreamExt};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+
+/// Bound on the number of un-encoded record batches buffered between the
+/// reader thread and the gRPC encoder. A small value gives backpressure
+/// to a fast Python producer when the network is slow.
+const BATCH_CHANNEL_CAPACITY: usize = 2;
 
 /// Internal `FlightService` implementation that delegates `do_get` to a
 /// Python callable and returns `UNIMPLEMENTED` for every other RPC.
@@ -140,30 +147,55 @@ impl FlightService for PyFlightService {
         let do_get = self.do_get.clone();
         let event_loop = self.event_loop.clone();
 
-        // Eagerly call the Python callback and collect all batches while
-        // holding the GIL. This keeps the binding minimal at the cost of
-        // buffering the response in memory.
-        let result = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+        // Step 1: invoke the Python callback (awaiting if it returned a
+        // coroutine) and extract a `RecordBatchReader` plus its schema. This
+        // is a single short GIL-held operation; we do *not* drain the reader
+        // here.
+        let (reader, schema) = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| -> PyResult<(ArrowArrayStreamReader, SchemaRef)> {
                 let cb = do_get.bind(py);
                 let py_ticket = PyBytes::new(py, &ticket);
                 let result = cb.call1((py_ticket,))?;
                 let result = await_if_coroutine(py, result, event_loop.as_ref())?;
-                let mut reader = ArrowArrayStreamReader::from_pyarrow_bound(&result)?;
+                let reader = ArrowArrayStreamReader::from_pyarrow_bound(&result)?;
                 let schema = reader.schema();
-                let batches = (&mut reader)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok((schema, batches))
+                Ok((reader, schema))
             })
         })
         .await
-        .map_err(|e| Status::internal(format!("do_get task panicked: {e}")))?;
+        .map_err(|e| Status::internal(format!("do_get task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("do_get callback failed: {e}")))?;
 
-        let (schema, batches) =
-            result.map_err(|e| Status::internal(format!("do_get callback failed: {e}")))?;
+        // Step 2: pull batches from the reader on a blocking thread and push
+        // them through a bounded channel. Each `.next()` call (and the final
+        // Drop) re-acquires the GIL so Python-implemented stream readers
+        // and PyArrow's release callbacks work correctly.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(
+            BATCH_CHANNEL_CAPACITY,
+        );
+        tokio::task::spawn_blocking(move || {
+            let mut reader = reader;
+            loop {
+                let next = Python::attach(|_py| reader.next());
+                match next {
+                    Some(Ok(batch)) => {
+                        if tx.blocking_send(Ok(batch)).is_err() {
+                            break; // consumer (client) went away
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = tx.blocking_send(Err(e.into()));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            // Drop the FFI reader under the GIL: PyArrow's release callback
+            // is implemented in Python and would deadlock otherwise.
+            Python::attach(|_py| drop(reader));
+        });
 
-        let input = futures::stream::iter(batches.into_iter().map(Ok));
+        let input = ReceiverStream::new(rx);
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(input)
