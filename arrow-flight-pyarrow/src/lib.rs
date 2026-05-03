@@ -19,9 +19,11 @@
 //!
 //! This crate exposes a single Python class, `FlightServer`, that lets users
 //! implement a Flight `do_get` endpoint with a Python callback. The callback
-//! receives the ticket bytes and is expected to return any object implementing
-//! the Arrow PyCapsule stream interface (e.g. a `pyarrow.RecordBatchReader`
-//! or a `pyarrow.Table`).
+//! receives the ticket bytes and must return any object that implements the
+//! [Arrow PyCapsule stream interface][capsule], for example a
+//! `pyarrow.RecordBatchReader`, a `pyarrow.Table`, a `polars.DataFrame`, a
+//! `duckdb` relation, or a `nanoarrow` array stream. There is no runtime
+//! dependency on `pyarrow` — any compatible producer works.
 //!
 //! The callback may be a regular function or an `async def` coroutine
 //! function. When `serve()` starts, a dedicated asyncio event loop is launched
@@ -29,6 +31,8 @@
 //! awaited before the result is encoded as Flight data.
 //!
 //! All other Flight RPCs return `UNIMPLEMENTED`.
+//!
+//! [capsule]: https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html
 
 #![warn(missing_docs)]
 

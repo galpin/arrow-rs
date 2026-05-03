@@ -24,4 +24,10 @@ name = "arrow-flight-pyarrow"
 version = "0.1.0"
 description = "Minimal Arrow Flight server bindings for Python"
 requires-python = ">=3.9"
-dependencies = ["pyarrow>=10"]
+# No required runtime dependencies: the binding only needs the user-returned
+# object to implement the Arrow PyCapsule stream interface
+# (https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+# Compatible producers include pyarrow>=14, polars, duckdb, and nanoarrow.
+
+[project.optional-dependencies]
+pyarrow = ["pyarrow>=14"]
