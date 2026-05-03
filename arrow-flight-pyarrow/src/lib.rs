@@ -23,10 +23,16 @@
 //! the Arrow PyCapsule stream interface (e.g. a `pyarrow.RecordBatchReader`
 //! or a `pyarrow.Table`).
 //!
+//! The callback may be a regular function or an `async def` coroutine
+//! function. When `serve()` starts, a dedicated asyncio event loop is launched
+//! on a Python thread; coroutine return values are scheduled on that loop and
+//! awaited before the result is encoded as Flight data.
+//!
 //! All other Flight RPCs return `UNIMPLEMENTED`.
 
 #![warn(missing_docs)]
 
+use std::ffi::CStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -44,7 +50,7 @@ use arrow_schema::SchemaRef;
 use futures::stream::{BoxStream, StreamExt};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -52,6 +58,33 @@ use tonic::{Request, Response, Status, Streaming};
 /// Python callable and returns `UNIMPLEMENTED` for every other RPC.
 struct PyFlightService {
     do_get: Arc<Py<PyAny>>,
+    /// Optional persistent asyncio event loop running on a dedicated Python
+    /// thread; coroutine results from `do_get` are awaited on this loop.
+    event_loop: Option<Arc<Py<PyAny>>>,
+}
+
+/// If `value` is a coroutine, schedule it on `event_loop` (which must be
+/// running on a separate Python thread) and block until it resolves; otherwise
+/// return `value` unchanged.
+fn await_if_coroutine<'py>(
+    py: Python<'py>,
+    value: Bound<'py, PyAny>,
+    event_loop: Option<&Arc<Py<PyAny>>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let asyncio = py.import("asyncio")?;
+    if !asyncio
+        .call_method1("iscoroutine", (&value,))?
+        .is_truthy()?
+    {
+        return Ok(value);
+    }
+    let loop_ = event_loop.ok_or_else(|| {
+        PyRuntimeError::new_err(
+            "do_get returned a coroutine but no asyncio event loop is running",
+        )
+    })?;
+    let cf = asyncio.call_method1("run_coroutine_threadsafe", (value, loop_.bind(py)))?;
+    cf.call_method0("result")
 }
 
 #[tonic::async_trait]
@@ -105,6 +138,7 @@ impl FlightService for PyFlightService {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner().ticket;
         let do_get = self.do_get.clone();
+        let event_loop = self.event_loop.clone();
 
         // Eagerly call the Python callback and collect all batches while
         // holding the GIL. This keeps the binding minimal at the cost of
@@ -114,6 +148,7 @@ impl FlightService for PyFlightService {
                 let cb = do_get.bind(py);
                 let py_ticket = PyBytes::new(py, &ticket);
                 let result = cb.call1((py_ticket,))?;
+                let result = await_if_coroutine(py, result, event_loop.as_ref())?;
                 let mut reader = ArrowArrayStreamReader::from_pyarrow_bound(&result)?;
                 let schema = reader.schema();
                 let batches = (&mut reader)
@@ -166,12 +201,53 @@ impl FlightService for PyFlightService {
     }
 }
 
+/// Python helper that starts a dedicated asyncio event loop on a daemon thread
+/// and returns it. The thread keeps running for the lifetime of the loop; the
+/// caller is responsible for stopping the loop when done.
+const START_LOOP_PY: &CStr = c"
+import asyncio
+import threading
+
+def _start_loop():
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+    def runner():
+        asyncio.set_event_loop(loop)
+        started.set()
+        loop.run_forever()
+    threading.Thread(target=runner, daemon=True).start()
+    started.wait()
+    return loop
+
+loop = _start_loop()
+";
+
+fn start_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let globals = PyDict::new(py);
+    py.run(START_LOOP_PY, Some(&globals), None)?;
+    Ok(globals
+        .get_item("loop")?
+        .ok_or_else(|| PyRuntimeError::new_err("failed to start asyncio event loop"))?
+        .unbind())
+}
+
+fn stop_event_loop(py: Python<'_>, event_loop: &Py<PyAny>) {
+    let bound = event_loop.bind(py);
+    if let Ok(stop) = bound.getattr("stop")
+        && let Err(e) = bound.call_method1("call_soon_threadsafe", (stop,))
+    {
+        e.write_unraisable(py, Some(bound));
+    }
+}
+
 /// Minimal Python-facing Flight server.
 ///
 /// Construct with a `do_get` callback, then call `serve(addr)` to start
 /// listening. The callback receives the ticket as `bytes` and must return an
 /// object implementing the Arrow PyCapsule stream interface (for example a
-/// `pyarrow.RecordBatchReader` or `pyarrow.Table`).
+/// `pyarrow.RecordBatchReader` or `pyarrow.Table`). The callback may also be
+/// `async def`; coroutine return values are awaited on a dedicated asyncio
+/// event loop that runs for the lifetime of `serve()`.
 #[pyclass(module = "arrow_flight_pyarrow")]
 struct FlightServer {
     do_get: Py<PyAny>,
@@ -188,20 +264,27 @@ impl FlightServer {
     ///
     /// Blocks until the process receives `SIGINT` (Ctrl-C). The GIL is
     /// released while the server runs so that callbacks invoked from the
-    /// tokio runtime can re-acquire it.
+    /// tokio runtime can re-acquire it. A dedicated asyncio event loop is
+    /// started on a Python daemon thread to support `async def` callbacks
+    /// and is stopped before this method returns.
     fn serve(&self, py: Python<'_>, addr: &str) -> PyResult<()> {
         let addr: SocketAddr = addr
             .parse()
             .map_err(|e: std::net::AddrParseError| PyRuntimeError::new_err(e.to_string()))?;
         let do_get = Arc::new(self.do_get.clone_ref(py));
+        let event_loop = Arc::new(start_event_loop(py)?);
+        let event_loop_for_svc = event_loop.clone();
 
-        py.detach(move || {
+        let result = py.detach(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             rt.block_on(async move {
-                let svc = PyFlightService { do_get };
+                let svc = PyFlightService {
+                    do_get,
+                    event_loop: Some(event_loop_for_svc),
+                };
                 let shutdown = async {
                     let _ = tokio::signal::ctrl_c().await;
                 };
@@ -211,7 +294,10 @@ impl FlightServer {
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
-        })
+        });
+
+        stop_event_loop(py, &event_loop);
+        result
     }
 }
 
