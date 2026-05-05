@@ -65,6 +65,10 @@ exclude = [
     # significantly changing how it is compiled within the workspace, causing the whole workspace to be compiled from
     # scratch this way, this is a stand-alone package that compiles independently of the others.
     "arrow-pyarrow-integration-testing",
+    # arrow-flight-pyarrow is excluded for the same reason as arrow-pyarrow-integration-testing:
+    # it builds a Python extension module (cdylib + extension-module pyo3 feature) and needs
+    # different compilation flags from the rest of the workspace.
+    "arrow-flight-pyarrow",
 ]
 
 [workspace.package]
